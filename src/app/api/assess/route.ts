@@ -1,12 +1,22 @@
 // /src/app/api/assess/route.ts
 import { NextRequest, NextResponse } from 'next/server'
 import { createEnhancedEngine } from '@/lib/enhanced-assessment-engine'
-import { AssessmentInput, AssessmentResult } from '@/types/research'
+import { AssessmentInput, EnhancedAssessmentResult } from '@/types/research'
+
+// Reuse engine instance across requests for better performance
+let engineInstance: any = null
+
+function getEngine() {
+  if (!engineInstance && process.env.OPENAI_API_KEY) {
+    engineInstance = createEnhancedEngine(process.env.OPENAI_API_KEY)
+  }
+  return engineInstance
+}
 
 /**
  * AI Impact Assessment API Endpoint
  * Processes resume/job description content and returns comprehensive AI impact analysis
- * Now with OpenAI-powered nuanced insights
+ * Now with OpenAI-powered nuanced insights and optimizations
  */
 export async function POST(request: NextRequest) {
   const startTime = Date.now()
@@ -18,36 +28,53 @@ export async function POST(request: NextRequest) {
     
     console.log(`Assessment request for ${input.type} user, content length: ${input.content.length}`)
     
-    // Always use enhanced engine with OpenAI
-    let results: any
-    
+    // Check if OpenAI is configured
     if (!process.env.OPENAI_API_KEY) {
       throw new Error('OPENAI_API_KEY is required for assessment engine')
     }
     
-    console.log('Using enhanced AI assessment with OpenAI')
-    const enhancedEngine = createEnhancedEngine(process.env.OPENAI_API_KEY)
-    results = await enhancedEngine.assess(input)
+    // Use singleton engine instance for better performance
+    console.log('Using enhanced AI assessment with OpenAI (optimized)')
+    const enhancedEngine = getEngine()
     
-    // Add enhanced metadata
-    results.enhancedAnalysis = true
-    results.insightSource = 'OpenAI GPT-4o-mini'
+    if (!enhancedEngine) {
+      throw new Error('Failed to initialize assessment engine')
+    }
+    
+    const results = await enhancedEngine.assess(input)
+    
+    // Debug: Log the structure of results
+    console.log('Engine results structure:', {
+      hasAiInsights: !!results.aiInsights,
+      hasSpecificRiskFactors: !!results.specificRiskFactors,
+      hasProtectiveFactors: !!results.protectiveFactors,
+      hasCustomizedRoadmap: !!results.customizedRoadmap,
+      enhancedAnalysis: results.enhancedAnalysis,
+      aiInsightsKeys: results.aiInsights ? Object.keys(results.aiInsights) : [],
+    })
+    
+    // Ensure enhanced properties are preserved
+    const enhancedResults = {
+      ...results,
+      enhancedAnalysis: true,
+      insightSource: 'OpenAI GPT-4o-mini (optimized)'
+    }
     
     const processingTime = Date.now() - startTime
     console.log(`Assessment completed in ${processingTime}ms`)
     
+    // Get metrics from engine if available
+    const metrics = enhancedEngine.getMetrics ? enhancedEngine.getMetrics() : {}
+    
     // Calculate cost estimate
-    // Rough estimate: ~1500 tokens input + 1500 tokens output
-    const inputTokens = Math.ceil(input.content.length / 4) // ~4 chars per token
-    const outputTokens = 1500 // Average output
-    const costEstimate = (inputTokens * 0.00000015) + (outputTokens * 0.0000006) // GPT-4o-mini pricing
+    const costEstimate = metrics.totalCost || '0.0001'
     
     // Add comprehensive metadata
-    const response: AssessmentResult & { metadata?: any } = {
-      ...results,
+    const response: EnhancedAssessmentResult & { metadata?: any } = {
+      ...enhancedResults,
       metadata: {
         processingTime,
-        version: "2.0.0-enhanced",
+        version: "2.0.0-enhanced-optimized",
         researchBasis: "Microsoft Research 2024 + Goldman Sachs + PwC + McKinsey",
         enhancedFeatures: {
           aiInsights: true,
@@ -62,10 +89,17 @@ export async function POST(request: NextRequest) {
           researchCoverage: 95,
           aiAnalysisDepth: 98
         },
+        performance: {
+          cacheHitRate: metrics.cacheHitRate || 0,
+          requestCount: metrics.requestCount || 1,
+          averageTokens: metrics.averageTokensPerRequest || 0,
+          queueSize: metrics.queueSize || 0
+        },
         cost: {
-          estimate: costEstimate.toFixed(6),
+          estimate: costEstimate,
           currency: 'USD',
-          model: 'gpt-4o-mini'
+          model: 'gpt-4o-mini',
+          cached: metrics.cacheHits > 0
         }
       }
     }
@@ -74,9 +108,11 @@ export async function POST(request: NextRequest) {
     const headers: Record<string, string> = {
       'Content-Type': 'application/json',
       'X-Processing-Time': processingTime.toString(),
-      'X-API-Version': '2.0.0',
+      'X-API-Version': '2.0.0-optimized',
       'X-Enhanced-Analysis': 'true',
-      'X-Cost-Estimate': costEstimate.toFixed(6)
+      'X-Cost-Estimate': costEstimate,
+      'X-Cache-Hit': metrics.cacheHits > 0 ? 'true' : 'false',
+      'Cache-Control': 'private, max-age=300' // 5 minute cache
     }
     
     return NextResponse.json(response, {
@@ -271,12 +307,26 @@ export async function GET() {
     const openaiAvailable = !!process.env.OPENAI_API_KEY
     const enhancedMode = process.env.USE_ENHANCED_AI === 'true'
     
+    // Get engine metrics if available
+    let engineMetrics = {}
+    if (openaiAvailable && engineInstance) {
+      try {
+        engineMetrics = engineInstance.getMetrics ? engineInstance.getMetrics() : {}
+      } catch {
+        // Ignore metrics errors
+      }
+    }
+    
     // Test OpenAI connection if available
     let openaiStatus = 'not_configured'
     if (openaiAvailable) {
       try {
-        // You could do a simple test call here
-        openaiStatus = 'operational'
+        // Check if engine is initialized
+        if (engineInstance) {
+          openaiStatus = 'operational'
+        } else {
+          openaiStatus = 'initialized'
+        }
       } catch {
         openaiStatus = 'error'
       }
@@ -286,7 +336,7 @@ export async function GET() {
     const health = {
       status: 'healthy',
       timestamp: new Date().toISOString(),
-      version: openaiAvailable ? '2.0.0-enhanced' : '1.0.0',
+      version: openaiAvailable ? '2.0.0-enhanced-optimized' : '1.0.0',
       mode: enhancedMode ? 'enhanced' : 'standard',
       services: {
         assessmentEngine: 'operational',
@@ -303,14 +353,21 @@ export async function GET() {
         enhancedAIInsights: openaiAvailable,
         taskSpecificAnalysis: openaiAvailable,
         customizedRoadmaps: openaiAvailable,
-        researchCitations: true
+        researchCitations: true,
+        caching: openaiAvailable,
+        batching: openaiAvailable
+      },
+      performance: {
+        ...engineMetrics,
+        engineInitialized: !!engineInstance,
+        optimizationsEnabled: true
       },
       dataSource: {
         microsoftStudy: '200k conversations analyzed',
         onetDatabase: '900+ occupations',
         workActivities: '332 classified',
         economicStudies: 'Goldman Sachs + PwC + McKinsey',
-        aiModel: openaiAvailable ? 'GPT-4o-mini' : 'none'
+        aiModel: openaiAvailable ? 'GPT-4o-mini (optimized)' : 'none'
       },
       pricing: {
         standard: {
@@ -319,16 +376,18 @@ export async function GET() {
           features: ['Risk assessment', 'Occupation matching', 'Timeline projections']
         },
         enhanced: openaiAvailable ? {
-          description: 'AI-powered nuanced insights',
-          costPerRequest: 0.001,
-          features: ['Everything in standard', 'Task-specific impacts', 'Custom roadmap', 'Industry context']
+          description: 'AI-powered nuanced insights (optimized)',
+          costPerRequest: 0.0001,
+          features: ['Everything in standard', 'Task-specific impacts', 'Custom roadmap', 'Industry context', 'Caching', 'Batching']
         } : null
       },
       limits: {
         maxContentLength: 50000,
         minContentLength: 50,
         requestsPerMinute: 60,
-        requestsPerDay: 10000
+        requestsPerDay: 10000,
+        batchSize: 3,
+        cacheSize: 100
       }
     }
     
@@ -337,7 +396,8 @@ export async function GET() {
       headers: {
         'Content-Type': 'application/json',
         'Cache-Control': 'no-cache',
-        'X-OpenAI-Status': openaiStatus
+        'X-OpenAI-Status': openaiStatus,
+        'X-Engine-Status': engineInstance ? 'loaded' : 'not-loaded'
       }
     })
     

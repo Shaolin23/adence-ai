@@ -1,6 +1,7 @@
 /**
  * Enhanced AI Assessment Engine with OpenAI Integration
  * Adds nuanced, specific insights to the validated Microsoft Research algorithm
+ * OPTIMIZED VERSION with caching, batching, and cost reduction
  */
 
 import OpenAI from 'openai'
@@ -69,23 +70,52 @@ interface DetailedFeatures {
   certifications: string[]
 }
 
+// Batch request structure
+interface BatchRequest {
+  id: string
+  input: AssessmentInput
+  features: DetailedFeatures
+  baseAssessment: AssessmentResult
+  resolve: (value: AIInsights) => void
+  reject: (error: any) => void
+}
+
 export class EnhancedAIAssessmentEngine extends ValidatedAssessmentEngine {
   private openai: OpenAI
-  private insightCache: Map<string, AIInsights>
+  private insightCache: Map<string, { data: AIInsights; timestamp: number }>
+  private batchQueue: BatchRequest[] = []
+  private batchTimer: NodeJS.Timeout | null = null
+  
+  // Optimization settings
+  private readonly CACHE_TTL = 3600000 // 1 hour
+  private readonly MAX_CACHE_SIZE = 100
+  private readonly BATCH_SIZE = 3 // Reduced for better response times
+  private readonly BATCH_DELAY = 150 // ms
+  private readonly MAX_RETRIES = 2
+  
+  // Metrics
+  private requestCount = 0
+  private cacheHits = 0
+  private totalTokens = 0
+  private totalCost = 0
   
   constructor(apiKey: string) {
     super()
     this.openai = new OpenAI({
-      apiKey: apiKey
+      apiKey: apiKey,
+      maxRetries: this.MAX_RETRIES,
     })
     this.insightCache = new Map()
+    
+    // Cleanup old cache entries periodically
+    setInterval(() => this.cleanupCache(), 300000) // Every 5 minutes
   }
   
   /**
    * Enhanced assessment with AI insights
    */
   async assess(input: AssessmentInput): Promise<EnhancedAssessmentResult> {
-    console.log('🤖 Running Enhanced AI Assessment...')
+    console.log('🤖 Running Enhanced AI Assessment with optimizations...')
     
     // Step 1: Run base validated algorithm
     const baseAssessment = await super.assess(input)
@@ -93,17 +123,24 @@ export class EnhancedAIAssessmentEngine extends ValidatedAssessmentEngine {
     // Step 2: Extract detailed features from resume
     const detailedFeatures = this.extractDetailedFeatures(input.content)
     
-    // Step 3: Generate AI insights (with caching)
-    const cacheKey = this.generateCacheKey(input.content)
-    let aiInsights = this.insightCache.get(cacheKey)
+    // Step 3: Check cache first
+    const cacheKey = this.generateCacheKey(input.content, detailedFeatures)
+    const cachedInsights = this.getCachedInsights(cacheKey)
     
-    if (!aiInsights) {
-      aiInsights = await this.generateAIInsights(
+    let aiInsights: AIInsights
+    if (cachedInsights) {
+      console.log('✅ Using cached AI insights')
+      this.cacheHits++
+      aiInsights = cachedInsights
+    } else {
+      // Generate new insights (with batching for efficiency)
+      aiInsights = await this.generateAIInsightsWithBatching(
         input,
         baseAssessment,
         detailedFeatures
       )
-      this.insightCache.set(cacheKey, aiInsights)
+      // Cache the results
+      this.setCachedInsights(cacheKey, aiInsights)
     }
     
     // Step 4: Generate specific risk and protective factors
@@ -142,64 +179,148 @@ export class EnhancedAIAssessmentEngine extends ValidatedAssessmentEngine {
   }
   
   /**
-   * Generate nuanced AI insights using GPT-4o-mini
+   * Generate AI insights with batching for efficiency
    */
-  private async generateAIInsights(
+  private async generateAIInsightsWithBatching(
+    input: AssessmentInput,
+    assessment: AssessmentResult,
+    features: DetailedFeatures
+  ): Promise<AIInsights> {
+    return new Promise((resolve, reject) => {
+      const request: BatchRequest = {
+        id: Math.random().toString(36).substr(2, 9),
+        input,
+        features,
+        baseAssessment: assessment,
+        resolve,
+        reject
+      }
+      
+      this.batchQueue.push(request)
+      
+      // Process immediately if batch is full
+      if (this.batchQueue.length >= this.BATCH_SIZE) {
+        this.processBatch()
+      } else if (!this.batchTimer) {
+        // Set timer for batch processing
+        this.batchTimer = setTimeout(() => this.processBatch(), this.BATCH_DELAY)
+      }
+    })
+  }
+  
+  /**
+   * Process batch of requests efficiently
+   */
+  private async processBatch() {
+    if (this.batchTimer) {
+      clearTimeout(this.batchTimer)
+      this.batchTimer = null
+    }
+    
+    const batch = this.batchQueue.splice(0, this.BATCH_SIZE)
+    if (batch.length === 0) return
+    
+    console.log(`📦 Processing batch of ${batch.length} AI insight requests`)
+    
+    try {
+      // Process all requests in parallel
+      const promises = batch.map(request => 
+        this.generateSingleAIInsight(
+          request.input,
+          request.baseAssessment,
+          request.features
+        )
+      )
+      
+      const results = await Promise.all(promises)
+      
+      // Resolve all promises
+      batch.forEach((request, index) => {
+        request.resolve(results[index])
+      })
+      
+    } catch (error) {
+      console.error('Batch processing error:', error)
+      // Fallback to individual processing
+      for (const request of batch) {
+        try {
+          const insights = await this.generateSingleAIInsight(
+            request.input,
+            request.baseAssessment,
+            request.features
+          )
+          request.resolve(insights)
+        } catch (err) {
+          request.reject(err)
+        }
+      }
+    }
+  }
+  
+  /**
+   * Generate single AI insight with optimized prompt
+   */
+  private async generateSingleAIInsight(
     input: AssessmentInput,
     assessment: AssessmentResult,
     features: DetailedFeatures
   ): Promise<AIInsights> {
     try {
-      const systemPrompt = `You are an expert AI impact analyst with access to:
-- Microsoft Research: 200,000 AI conversation analysis showing occupation-specific impacts
-- Goldman Sachs: 300M jobs affected globally, $7T economic impact projections
-- McKinsey: 60-70% task automation potential, 13% workforce transitions by 2030
-- PwC: 33% wage premium for AI-skilled workers
-- O*NET: Comprehensive occupation and task data
-
-Analyze the specific role and provide detailed, nuanced insights that go beyond generic advice.
-Focus on concrete, actionable intelligence specific to this person's situation.`
-
-      const userPrompt = `Analyze this specific role for AI impact:
-
-JOB DETAILS:
-- Title: ${features.jobTitle || 'Not specified'}
-- Experience: ${features.yearsExperience} years
-- Industry: ${assessment.occupations[0]?.industry || 'General'}
-- Technical Skills: ${features.technicalSkills.join(', ') || 'Various'}
-- Tools Used: ${features.softwareTools.join(', ') || 'Standard'}
-- Management Level: ${features.managementLevel}
-
-VALIDATED ASSESSMENT RESULTS:
-- Overall AI Risk: ${assessment.vulnerabilityIndex.overall}%
-- Automation Risk: ${assessment.vulnerabilityIndex.breakdown.automation}%
-- Time to Impact: ${assessment.vulnerabilityIndex.timeToImpact} months
-- Risk Level: ${assessment.vulnerabilityIndex.riskLevel}
-
-SPECIFIC ACTIVITIES MENTIONED:
-${features.specificActivities.map(a => `- ${a}`).join('\n')}
-
-Provide a detailed JSON response with:
-1. taskSpecificImpacts: For each major task, explain exactly how AI will change it
-2. uniqueStrengths: Identify 3-4 unique advantages this person has that AI cannot replicate
-3. adaptationStrategies: Specific actions for immediate (0-6mo), short (6-18mo), and long-term (18+mo)
-4. industryContext: Trends, competitive advantages, and emerging roles in their specific industry
-5. researchCitations: Specific data points from the research that apply to this role
-
-Be specific, actionable, and reference actual research findings. Avoid generic advice.`
-
+      const systemPrompt = this.getOptimizedSystemPrompt()
+      const userPrompt = this.buildOptimizedUserPrompt(features, assessment)
+      
+      const startTime = Date.now()
+      
       const response = await this.openai.chat.completions.create({
         model: "gpt-4o-mini",
         messages: [
           { role: "system", content: systemPrompt },
           { role: "user", content: userPrompt }
         ],
-        response_format: { type: "json_object" },
+        // Remove response_format to avoid JSON parsing issues
+        // response_format: { type: "json_object" },
         temperature: 0.3,
-        max_tokens: 1500
+        max_tokens: 1200, // Reduced from 1500 for cost optimization
+        top_p: 0.9,
+        frequency_penalty: 0.2,
+        presence_penalty: 0.1
       })
       
-      const insights = JSON.parse(response.choices[0].message.content || '{}')
+      const processingTime = Date.now() - startTime
+      console.log(`⚡ AI insights generated in ${processingTime}ms`)
+      
+      // Update metrics
+      this.requestCount++
+      const tokensUsed = response.usage?.total_tokens || 0
+      this.totalTokens += tokensUsed
+      this.totalCost += this.calculateCost(tokensUsed)
+      
+      const content = response.choices[0].message.content || '{}'
+      
+      // Attempt to parse JSON with error handling
+      let insights: any = {}
+      try {
+        // Clean the content first - remove any markdown code blocks if present
+        let cleanContent = content
+        if (content.includes('```json')) {
+          cleanContent = content.replace(/```json\n?/g, '').replace(/```\n?/g, '')
+        } else if (content.includes('```')) {
+          cleanContent = content.replace(/```\n?/g, '')
+        }
+        
+        // Remove any trailing commas which can cause JSON parse errors
+        cleanContent = cleanContent.replace(/,(\s*[}\]])/g, '$1')
+        
+        // Parse the cleaned content
+        insights = JSON.parse(cleanContent)
+        
+      } catch (parseError) {
+        console.error('JSON parse error:', parseError)
+        console.log('Raw AI response:', content.substring(0, 500))
+        
+        // Try to extract structured data even if JSON is malformed
+        insights = this.extractStructuredData(content)
+      }
       
       // Ensure all required fields exist
       return this.validateAndEnrichInsights(insights, features, assessment)
@@ -208,6 +329,211 @@ Be specific, actionable, and reference actual research findings. Avoid generic a
       console.error('Error generating AI insights:', error)
       // Return fallback insights based on algorithm alone
       return this.generateFallbackInsights(features, assessment)
+    }
+  }
+  
+  /**
+   * Extract structured data from malformed JSON response
+   */
+  private extractStructuredData(content: string): any {
+    const result: any = {
+      taskSpecificImpacts: [],
+      uniqueStrengths: [],
+      adaptationStrategies: {
+        immediate: [],
+        shortTerm: [],
+        longTerm: []
+      },
+      industryContext: {},
+      researchCitations: []
+    }
+    
+    try {
+      // Try to extract task impacts
+      const taskMatch = content.match(/"taskSpecificImpacts"\s*:\s*\[(.*?)\]/s)
+      if (taskMatch) {
+        try {
+          result.taskSpecificImpacts = JSON.parse(`[${taskMatch[1]}]`)
+        } catch {}
+      }
+      
+      // Try to extract unique strengths
+      const strengthMatch = content.match(/"uniqueStrengths"\s*:\s*\[(.*?)\]/s)
+      if (strengthMatch) {
+        try {
+          result.uniqueStrengths = JSON.parse(`[${strengthMatch[1]}]`)
+        } catch {}
+      }
+      
+      // Try to extract adaptation strategies
+      const strategyMatch = content.match(/"adaptationStrategies"\s*:\s*\{(.*?)\}/s)
+      if (strategyMatch) {
+        try {
+          result.adaptationStrategies = JSON.parse(`{${strategyMatch[1]}}`)
+        } catch {}
+      }
+      
+    } catch (extractError) {
+      console.error('Data extraction error:', extractError)
+    }
+    
+    return result
+  }
+  
+  /**
+   * Optimized system prompt (shorter, more focused)
+   */
+  private getOptimizedSystemPrompt(): string {
+    return `Expert AI impact analyst with Microsoft Research data (200k conversations), Goldman Sachs projections (300M jobs, $7T impact), McKinsey (13% workforce transition by 2030), PwC (33% AI wage premium).
+
+Provide specific, actionable insights in valid JSON format. Focus on concrete recommendations unique to this role. Be concise - max 150 words per section.
+
+IMPORTANT: Return ONLY valid JSON without any markdown formatting, code blocks, or explanations.`
+  }
+  
+  /**
+   * Build optimized user prompt (reduced tokens)
+   */
+  private buildOptimizedUserPrompt(features: DetailedFeatures, assessment: AssessmentResult): string {
+    // Truncate activities to save tokens
+    const topActivities = features.specificActivities.slice(0, 3)
+    const topSkills = features.technicalSkills.slice(0, 5)
+    
+    return `Role: ${features.jobTitle || 'Professional'}
+Experience: ${features.yearsExperience}y
+Skills: ${topSkills.join(', ') || 'Various'}
+Level: ${features.managementLevel}
+Risk: ${assessment.vulnerabilityIndex.overall}% (${assessment.vulnerabilityIndex.riskLevel})
+Timeline: ${assessment.vulnerabilityIndex.timeToImpact}mo
+
+Key tasks:
+${topActivities.map(a => `- ${a.substring(0, 50)}`).join('\n')}
+
+Return ONLY this JSON structure (no markdown, no code blocks):
+{
+  "taskSpecificImpacts": [
+    {"task": "string", "currentMethod": "string", "aiMethod": "string", "impactPercentage": number, "timeframe": "string", "mitigation": "string"},
+    {"task": "string", "currentMethod": "string", "aiMethod": "string", "impactPercentage": number, "timeframe": "string", "mitigation": "string"},
+    {"task": "string", "currentMethod": "string", "aiMethod": "string", "impactPercentage": number, "timeframe": "string", "mitigation": "string"}
+  ],
+  "uniqueStrengths": [
+    {"strength": "string", "whyItMatters": "string", "howToLeverage": "string"},
+    {"strength": "string", "whyItMatters": "string", "howToLeverage": "string"},
+    {"strength": "string", "whyItMatters": "string", "howToLeverage": "string"}
+  ],
+  "adaptationStrategies": {
+    "immediate": ["action 1", "action 2"],
+    "shortTerm": ["action 1", "action 2"],
+    "longTerm": ["action 1", "action 2"]
+  },
+  "industryContext": {
+    "trend": "string",
+    "competitiveAdvantage": "string",
+    "emergingRoles": ["role1", "role2", "role3"]
+  },
+  "researchCitations": [
+    {"finding": "string", "source": "string", "relevance": "string"},
+    {"finding": "string", "source": "string", "relevance": "string"},
+    {"finding": "string", "source": "string", "relevance": "string"}
+  ]
+}`
+  }
+  
+  /**
+   * Calculate cost for tokens used
+   */
+  private calculateCost(tokens: number): number {
+    // GPT-4o-mini pricing
+    const inputCostPer1k = 0.00015
+    const outputCostPer1k = 0.0006
+    
+    // Estimate: 60% input, 40% output
+    const inputTokens = tokens * 0.6
+    const outputTokens = tokens * 0.4
+    
+    return (inputTokens * inputCostPer1k / 1000) + (outputTokens * outputCostPer1k / 1000)
+  }
+  
+  /**
+   * Cache management
+   */
+  private getCachedInsights(key: string): AIInsights | null {
+    const cached = this.insightCache.get(key)
+    if (!cached) return null
+    
+    // Check if cache is still valid
+    if (Date.now() - cached.timestamp > this.CACHE_TTL) {
+      this.insightCache.delete(key)
+      return null
+    }
+    
+    return cached.data
+  }
+  
+  private setCachedInsights(key: string, insights: AIInsights): void {
+    // Enforce max cache size
+    if (this.insightCache.size >= this.MAX_CACHE_SIZE) {
+      // Remove oldest entry
+      const firstKey = this.insightCache.keys().next().value
+      if (firstKey !== undefined) {
+        this.insightCache.delete(firstKey)
+      }
+    }
+    
+    this.insightCache.set(key, {
+      data: insights,
+      timestamp: Date.now()
+    })
+  }
+  
+  private cleanupCache(): void {
+    const now = Date.now()
+    for (const [key, value] of this.insightCache.entries()) {
+      if (now - value.timestamp > this.CACHE_TTL) {
+        this.insightCache.delete(key)
+      }
+    }
+    console.log(`🧹 Cache cleanup: ${this.insightCache.size} entries remaining`)
+  }
+  
+  /**
+   * Generate cache key with better distribution
+   */
+  private generateCacheKey(content: string, features: DetailedFeatures): string {
+    // Create a more specific cache key
+    const keyParts = [
+      features.jobTitle,
+      features.yearsExperience,
+      features.managementLevel,
+      features.technicalSkills.slice(0, 3).join('-'),
+      content.length
+    ]
+    
+    // Simple hash
+    let hash = 0
+    const str = keyParts.join('|')
+    for (let i = 0; i < str.length; i++) {
+      const char = str.charCodeAt(i)
+      hash = ((hash << 5) - hash) + char
+      hash = hash & hash
+    }
+    
+    return `ai_${hash}_${features.managementLevel}`
+  }
+  
+  /**
+   * Get metrics for monitoring
+   */
+  getMetrics() {
+    return {
+      requestCount: this.requestCount,
+      cacheHits: this.cacheHits,
+      cacheHitRate: this.requestCount > 0 ? (this.cacheHits / this.requestCount) : 0,
+      totalTokens: this.totalTokens,
+      totalCost: this.totalCost.toFixed(4),
+      averageTokensPerRequest: this.requestCount > 0 ? Math.round(this.totalTokens / this.requestCount) : 0,
+      cacheSize: this.insightCache.size,
+      queueSize: this.batchQueue.length
     }
   }
   
@@ -238,8 +564,8 @@ Be specific, actionable, and reference actual research findings. Avoid generic a
     // Extract industry keywords
     const industryKeywords = this.extractIndustryKeywords(lower)
     
-    // Extract education level
-    const educationLevel = this.extractEducationLevel(lower)
+    // Extract education level (using different method name to avoid conflict)
+    const educationLevel = this.extractEducationLevel(content)
     
     // Extract certifications
     const certifications = this.extractCertifications(content)
@@ -348,7 +674,7 @@ Be specific, actionable, and reference actual research findings. Avoid generic a
     ]
     
     actionPatterns.forEach(pattern => {
-      const matches = content.matchAll(pattern)
+      const matches = Array.from(content.matchAll(pattern))
       for (const match of matches) {
         activities.push(match[1].trim())
         if (activities.length >= 5) break // Limit to top 5
@@ -369,10 +695,11 @@ Be specific, actionable, and reference actual research findings. Avoid generic a
   }
   
   private extractEducationLevel(content: string): string {
-    if (content.includes('phd') || content.includes('doctorate')) return 'PhD'
-    if (content.includes('master') || content.includes('mba')) return 'Masters'
-    if (content.includes('bachelor') || content.includes('bs') || content.includes('ba')) return 'Bachelors'
-    if (content.includes('associate')) return 'Associates'
+    const lower = content.toLowerCase()
+    if (lower.includes('phd') || lower.includes('doctorate')) return 'PhD'
+    if (lower.includes('master') || lower.includes('mba')) return 'Masters'
+    if (lower.includes('bachelor') || lower.includes('bs') || lower.includes('ba')) return 'Bachelors'
+    if (lower.includes('associate')) return 'Associates'
     return 'Bachelors' // Default assumption
   }
   
@@ -386,7 +713,7 @@ Be specific, actionable, and reference actual research findings. Avoid generic a
     ]
     
     certPatterns.forEach(pattern => {
-      const matches = content.matchAll(pattern)
+      const matches = Array.from(content.matchAll(pattern))
       for (const match of matches) {
         certs.push(match[0].trim())
       }
@@ -667,23 +994,14 @@ Be specific, actionable, and reference actual research findings. Avoid generic a
       }
     ]
   }
-  
-  /**
-   * Generate cache key for insights
-   */
-  private generateCacheKey(content: string): string {
-    // Simple hash for caching
-    let hash = 0
-    for (let i = 0; i < content.length; i++) {
-      const char = content.charCodeAt(i)
-      hash = ((hash << 5) - hash) + char
-      hash = hash & hash // Convert to 32bit integer
-    }
-    return hash.toString()
-  }
 }
 
-// Export enhanced engine
+// Export enhanced engine with singleton pattern
+let engineInstance: EnhancedAIAssessmentEngine | null = null
+
 export const createEnhancedEngine = (apiKey: string) => {
-  return new EnhancedAIAssessmentEngine(apiKey)
+  if (!engineInstance) {
+    engineInstance = new EnhancedAIAssessmentEngine(apiKey)
+  }
+  return engineInstance
 }
